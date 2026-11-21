@@ -194,7 +194,7 @@ function Test-EDiscoveryAccess {
     [CmdletBinding()]
     param()
     Assert-EDConnected
-    $null = Invoke-EDGraphGet -Uri "$($script:GraphBase)?\$top=1"
+    $null = Invoke-EDGraphGet -Uri "$($script:GraphBase)?`$top=1"
     $token = Get-EDPurviewToken
     $claims = Get-EDJwtClaims -Jwt $token.AccessToken
     if (@(Get-EDProperty -InputObject $claims -Name 'roles') -notcontains 'eDiscovery.Download.Read') {
@@ -321,7 +321,7 @@ function Download-Export {
         }
         if ($Export.Status -notin @('succeeded', 'partiallySucceeded')) {
             Write-Warning "Skipping '$($Export.Name)' because its status is '$($Export.Status)'."
-            return
+            continue
         }
 
         $url = "$($script:GraphBase)/$([uri]::EscapeDataString([string]$Export.CaseId))/operations/$([uri]::EscapeDataString([string]$Export.ExportId))"
