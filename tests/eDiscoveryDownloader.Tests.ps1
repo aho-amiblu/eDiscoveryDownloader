@@ -105,3 +105,44 @@ Describe 'Download-Export safeguards' {
         }
     }
 }
+
+
+Describe 'Import-ExportSupportInfo' {
+    InModuleScope eDiscoveryDownloader {
+        BeforeAll {
+            $script:sampleSupportJson = @{
+                tenantId = 'abe233c7-2098-4409-91fc-b0da584aef6b'
+                caseId = 'ccec2be3-f6c4-4ced-b513-6c3629af2b28'
+                jobId = '94eb8fcee6c043b383cbc2a76ba32826'
+                jobState = 'Completed'
+                jobName = 'DirectExport'
+                created = '2026-11-20T09:08:56Z'
+            } | ConvertTo-Json
+        }
+        It 'accepts support JSON on the pipeline' {
+            $export = $script:sampleSupportJson | Import-ExportSupportInfo
+            $export.PSTypeNames | Should -Contain 'eDiscoveryDownloader.Export'
+            $export.CaseId | Should -Be 'ccec2be3-f6c4-4ced-b513-6c3629af2b28'
+            $export.ExportId | Should -Be '94eb8fcee6c043b383cbc2a76ba32826'
+            $export.Status | Should -Be 'succeeded'
+        }
+        It 'accepts support JSON from a file' {
+            $path = Join-Path $TestDrive 'support.json'
+            Set-Content -LiteralPath $path -Value $script:sampleSupportJson
+            (Import-ExportSupportInfo -Path $path).Name | Should -Be 'DirectExport'
+        }
+        It 'rejects missing job IDs' {
+            $invalid = @{ tenantId = 'abe233c7-2098-4409-91fc-b0da584aef6b'; caseId = 'ccec2be3-f6c4-4ced-b513-6c3629af2b28' } | ConvertTo-Json
+            { $invalid | Import-ExportSupportInfo } | Should -Throw '*valid jobId*'
+        }
+        It 'checks tenant matches when downloading' {
+            $script:EDConnection = @{ TenantId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'; ClientId = 'test' }
+            Mock Assert-EDConnected {}
+            Mock Invoke-EDGraphGet { throw 'Should not call Graph for a mismatched tenant' }
+            $export = $script:sampleSupportJson | Import-ExportSupportInfo
+            { $export | Download-Export -DestinationFolder (Join-Path $TestDrive 'export') -Confirm:$false } |
+                Should -Throw '*Support information is for tenant*'
+            Should -Invoke Invoke-EDGraphGet -Times 0
+        }
+    }
+}
