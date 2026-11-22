@@ -283,6 +283,225 @@ function Get-ExportList {
     }
 }
 
+
+function Import-ExportSupportInfo {
+    <#
+    .SYNOPSIS
+    Converts Purview's "Download support information" JSON into a Download-Export pipeline object.
+    .DESCRIPTION
+    This is an offline conversion; it does not authenticate or fetch download links.
+    Connect-EDiscovery is still required before using Download-Export.
+    .EXAMPLE
+    Import-ExportSupportInfo -Path '.\support.json' | Download-Export -DestinationFolder 'D:\Exports'
+    .EXAMPLE
+    Get-Clipboard -Raw | Import-ExportSupportInfo | Download-Export -DestinationFolder 'D:\Exports'
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'Path')]
+    param(
+        [Parameter(Mandatory, ParameterSetName = 'Path')][string]$Path,
+        [Parameter(Mandatory, ValueFromPipeline, ParameterSetName = 'InputObject')][object]$InputObject
+    )
+    process {
+        $info = if ($PSCmdlet.ParameterSetName -eq 'Path') {
+            Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        }
+        else { $InputObject }
+
+        if ($info -is [string]) {
+            try {
+                $info = ConvertFrom-Json -InputObject $info -ErrorAction Stop
+            }
+            catch {
+                throw "Invalid Purview support information JSON: $($_.Exception.Message)"
+            }
+        }
+
+        $tenantText = [string](Get-EDProperty -InputObject $info -Name 'tenantId')
+        $caseText = [string](Get-EDProperty -InputObject $info -Name 'caseId')
+        $jobText = [string](Get-EDProperty -InputObject $info -Name 'jobId')
+        $tenantGuid = [guid]::Empty
+        $caseGuid = [guid]::Empty
+        if (-not [guid]::TryParse($tenantText, [ref]$tenantGuid) -or $tenantGuid -eq [guid]::Empty) {
+            throw 'Support information does not contain a valid tenantId.'
+        }
+        if (-not [guid]::TryParse($caseText, [ref]$caseGuid) -or $caseGuid -eq [guid]::Empty) {
+            throw 'Support information does not contain a valid caseId.'
+        }
+        if ($jobText -notmatch '^(?:[0-9A-Fa-f]{32}|[0-9A-Fa-f-]{36})
+    param([string]$Name)
+    $result = ($Name -replace '[<>:"/\\|?*\x00-\x1F]', '_').Trim(' ', '.')
+    if ([string]::IsNullOrWhiteSpace($result)) { $result = 'Export' }
+    if ($result.Length -gt 80) { $result = $result.Substring(0, 80).TrimEnd(' ', '.') }
+    return $result
+}
+
+function Download-Export {
+    <#
+    .SYNOPSIS
+    Downloads all ZIP packages/reports from an existing eDiscovery export.
+    .EXAMPLE
+    Get-ExportList -Name '*Former User*' | Download-Export -DestinationFolder 'D:\eDiscovery'
+    .EXAMPLE
+    Get-ExportList | Out-GridView -PassThru | Download-Export -DestinationFolder 'D:\eDiscovery'
+    .EXAMPLE
+    Get-ExportList | Download-Export -DestinationFolder 'D:\eDiscovery' -WhatIf
+    #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)][psobject]$Export,
+        [Parameter(Mandatory)][string]$DestinationFolder,
+        [string]$PackageName = '*',
+        [ValidateRange(1, 10)][int]$RetryCount = 3,
+        [switch]$Force,
+        [switch]$NoSubfolder
+    )
+    begin {
+        Assert-EDConnected
+        $destinationRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DestinationFolder)
+    }
+    process {
+        if ($Export.PSTypeNames -notcontains 'eDiscoveryDownloader.Export') {
+            throw 'Download-Export expects objects from Get-ExportList or Import-ExportSupportInfo.'
+        }
+        if ($Export.PSObject.Properties['TenantId'] -and
+            [string]$Export.TenantId -ne [string]$script:EDConnection.TenantId) {
+            throw "Support information is for tenant $($Export.TenantId), but Connect-EDiscovery is connected to $($script:EDConnection.TenantId)."
+        }
+        if ($Export.Status -notin @('succeeded', 'partiallySucceeded')) {
+            Write-Warning "Skipping '$($Export.Name)' because its status is '$($Export.Status)'."
+            continue
+        }
+
+        $url = "$($script:GraphBase)/$([uri]::EscapeDataString([string]$Export.CaseId))/operations/$([uri]::EscapeDataString([string]$Export.ExportId))"
+        $details = Invoke-EDGraphGet -Uri $url
+        $extra = Get-EDProperty -InputObject $details -Name 'additionalProperties'
+        $metadata = Get-EDProperty -InputObject $details -Name 'exportFileMetadata'
+        if ($null -eq $metadata) { $metadata = Get-EDProperty -InputObject $extra -Name 'exportFileMetadata' }
+        $packages = @($metadata | Where-Object { $null -ne $_ })
+        if ($packages.Count -eq 0) {
+            throw "No download packages are available for '$($Export.Name)'. It may not be ready or the 14-day export retention may have expired."
+        }
+
+        $exportFolder = $destinationRoot
+        if (-not $NoSubfolder) {
+            $shortId = [string]$Export.ExportId
+            if ($shortId.Length -gt 8) { $shortId = $shortId.Substring(0, 8) }
+            $exportFolder = Join-Path $destinationRoot "$(ConvertTo-EDSafeName $Export.CaseName)\$(ConvertTo-EDSafeName $Export.Name)_$shortId"
+        }
+        foreach ($package in $packages) {
+            $fileName = [string](Get-EDProperty -InputObject $package -Name 'fileName')
+            if ($fileName -notlike $PackageName) { continue }
+            if ([string]::IsNullOrWhiteSpace($fileName) -or
+                [IO.Path]::GetFileName($fileName) -cne $fileName -or
+                $fileName -match '[<>:"/\\|?*\x00-\x1F]') {
+                throw 'Export metadata contains an invalid or unsafe package file name.'
+            }
+            $downloadUrl = [string](Get-EDProperty -InputObject $package -Name 'downloadUrl')
+            $downloadUri = $null
+            if (-not [uri]::TryCreate($downloadUrl, [UriKind]::Absolute, [ref]$downloadUri) -or
+                $downloadUri.Scheme -ne 'https' -or
+                $downloadUri.Host -notmatch '(^|\.)(cloud\.microsoft|microsoft\.com|windows\.net)$') {
+                throw "Unexpected package URL host for '$fileName'; refusing to send an access token."
+            }
+            $sizeText = Get-EDProperty -InputObject $package -Name 'size'
+            if ($null -eq $sizeText) { $sizeText = Get-EDProperty -InputObject $package -Name 'fileSize' }
+            $expectedBytes = [long]0
+            $null = [long]::TryParse([string]$sizeText, [ref]$expectedBytes)
+            $target = Join-Path $exportFolder $fileName
+            if (-not $PSCmdlet.ShouldProcess($target, "Download export package")) { continue }
+
+            $null = New-Item -Path $exportFolder -ItemType Directory -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $target -PathType Leaf) {
+                $existingSize = (Get-Item -LiteralPath $target).Length
+                if (-not $Force -and $expectedBytes -gt 0 -and $existingSize -eq $expectedBytes) {
+                    Write-Verbose "Skipping existing file with matching size: $target"
+                    [pscustomobject]@{ ExportName = $Export.Name; FileName = $fileName; Path = $target; Status = 'Skipped'; SizeBytes = $existingSize }
+                    continue
+                }
+                if (-not $Force) { throw "File already exists (size differs or size is unknown): $target. Use -Force to replace it." }
+            }
+
+            $part = "$target.partial"
+            $success = $false
+            for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
+                try {
+                    if (Test-Path -LiteralPath $part) { Remove-Item -LiteralPath $part -Force -ErrorAction Stop }
+                    $token = Get-EDPurviewToken
+                    $headers = @{
+                        Authorization = "Bearer $($token.AccessToken)"
+                        'X-AllowWithAADToken' = 'true'
+                    }
+                    Write-Progress -Activity "Downloading $($Export.Name)" -Status "$fileName (attempt $attempt/$RetryCount)"
+                    $null = Invoke-WebRequest -Method GET -Uri $downloadUrl -Headers $headers -OutFile $part -ErrorAction Stop
+                    $actualBytes = (Get-Item -LiteralPath $part -ErrorAction Stop).Length
+                    if ($expectedBytes -gt 0 -and $actualBytes -ne $expectedBytes) {
+                        throw "Size mismatch for '$fileName': expected $expectedBytes bytes, received $actualBytes."
+                    }
+                    if ($fileName.EndsWith('.zip', [StringComparison]::OrdinalIgnoreCase)) {
+                        $stream = [IO.File]::OpenRead($part)
+                        try {
+                            if ($stream.ReadByte() -ne 80 -or $stream.ReadByte() -ne 75) {
+                                throw "Response for '$fileName' was not a ZIP file (possibly an authentication redirect)."
+                            }
+                        }
+                        finally { $stream.Dispose() }
+                    }
+                    [IO.File]::Move($part, $target, [bool]$Force)
+                    [pscustomobject]@{ ExportName = $Export.Name; FileName = $fileName; Path = $target; Status = 'Downloaded'; SizeBytes = $actualBytes }
+                    $success = $true
+                    break
+                }
+                catch {
+                    Write-Warning "Download attempt $attempt/$RetryCount failed for '$fileName': $($_.Exception.Message)"
+                    $script:EDPurviewToken = $null
+                    if ($attempt -lt $RetryCount) { Start-Sleep -Seconds ([math]::Min($attempt * 2, 10)) }
+                }
+            }
+            if (-not $success) {
+                throw "Could not download '$fileName' after $RetryCount attempts. Check permissions, export expiry, and network access. Any .partial file is incomplete."
+            }
+        }
+        Write-Progress -Activity "Downloading $($Export.Name)" -Completed
+    }
+}
+
+Export-ModuleMember -Function Connect-EDiscovery, Test-EDiscoveryAccess, Get-ExportList, Import-ExportSupportInfo, Download-Export
+) {
+            throw 'Support information does not contain a valid jobId.'
+        }
+
+        $jobState = [string](Get-EDProperty -InputObject $info -Name 'jobState')
+        $state = switch ($jobState.ToLowerInvariant()) {
+            'completed' { 'succeeded'; break }
+            'completedwitherrors' { 'partiallySucceeded'; break }
+            'partiallysucceeded' { 'partiallySucceeded'; break }
+            'failed' { 'failed'; break }
+            'running' { 'running'; break }
+            default { 'notStarted' }
+        }
+        $shortId = $jobText.Substring(0, [math]::Min($jobText.Length, 8))
+        $name = [string](Get-EDProperty -InputObject $info -Name 'jobName')
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = "Export $shortId" }
+        $caseName = [string](Get-EDProperty -InputObject $info -Name 'caseName')
+        if ([string]::IsNullOrWhiteSpace($caseName)) { $caseName = "Case $caseGuid" }
+
+        [pscustomobject]@{
+            PSTypeName = 'eDiscoveryDownloader.Export'
+            Name = $name
+            CaseName = $caseName
+            Status = $state
+            Created = (Get-EDProperty -InputObject $info -Name 'created')
+            Packages = $null
+            SizeGB = $null
+            Action = 'FromSupportInfo'
+            CaseId = [string]$caseGuid
+            ExportId = $jobText
+            TenantId = [string]$tenantGuid
+            Source = 'PurviewSupportInfo'
+        }
+    }
+}
+
 function ConvertTo-EDSafeName {
     param([string]$Name)
     $result = ($Name -replace '[<>:"/\\|?*\x00-\x1F]', '_').Trim(' ', '.')
