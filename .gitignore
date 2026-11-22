@@ -1,0 +1,13 @@
+# Never commit downloaded mailbox contents or local authentication material
+*.pst
+*.pfx
+*.key
+*.partial
+*.zip
+support.json
+ExportLinks.csv
+ExportLinks.txt
+eDiscoveryDownloader-*.cer
+output/
+downloads/
+exports/
