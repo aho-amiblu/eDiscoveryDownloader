@@ -5,6 +5,84 @@ PowerShell 7 module for **listing existing Microsoft Purview eDiscovery exports*
 > [!IMPORTANT]
 > This downloads already-generated export ZIP packages (which may contain PSTs). It does **not** create a new search/export, extract PSTs, or bypass Purview permissions. Export packages normally expire after **14 days**. The API requires **app-only authentication**, and Microsoft documents this for **cases with premium features enabled**. Cases without premium features may require a different workflow. Test access with your specific case first.
 
+## Create the Entra application automatically (Windows)
+
+Use [scripts/New-EDiscoveryDownloaderApp.ps1](scripts/New-EDiscoveryDownloaderApp.ps1). It opens a Microsoft Graph **interactive administrator sign-in** (MFA supported), creates a **single-tenant** Entra app, provisions the MicrosoftPurviewEDiscovery enterprise service principal if needed, requests the two **Application** API permissions, and generates a local RSA certificate.
+
+The private key is **non-exportable and stays in your Windows CurrentUser/Personal certificate store**. A public .cer file is saved under Documents/eDiscoveryDownloader. No client secret, private key, or user mailbox content is uploaded to GitHub.
+
+Run in **PowerShell 7.2+ on Windows**, from the repository directory:
+
+~~~powershell
+# One-time setup. Sign in as an Entra administrator:
+$setup = .\scripts\New-EDiscoveryDownloaderApp.ps1 -TenantId '<tenant-guid>'
+
+# Review the resulting ClientId, thumbprint, and outstanding steps:
+$setup | Format-List
+
+# Complete admin consent and Purview role assignment as explained below.
+# Then authenticate to the downloader using the created certificate:
+Import-Module .\eDiscoveryDownloader.psm1
+Connect-EDiscovery -TenantId $setup.TenantId -ClientId $setup.ClientId -CertificateThumbprint $setup.CertificateThumbprint
+
+# Use Purview's "Download support information" JSON for an existing export:
+Import-ExportSupportInfo -Path '.\support.json' |
+    Download-Export -DestinationFolder 'D:\eDiscovery'
+~~~
+
+### Optional automation of administrative approvals
+
+By default, the script **requests** but does not grant admin consent or Purview roles. This prevents an accidental tenant-wide privilege grant. You can explicitly add:
+
+- **-GrantAdminConsent**: grants both app permissions using Graph. Requires an account authorized to assign application roles, often Privileged Role Administrator or another authorized role.
+- **-ConfigurePurviewRoles**: registers the app's service principal in Security & Compliance PowerShell and adds it to the **eDiscoveryManager** role group. Requires another interactive sign-in with Purview Role Management.
+- **-GrantEDiscoveryAdministrator**: only together with -ConfigurePurviewRoles; grants **tenant-wide eDiscovery Administrator access to all cases**. Do not enable unless broad access is needed.
+- **-NoInstall**: do not auto-install missing PowerShell modules.
+- **-CertificateMonths 6**: customize certificate lifetime (1–11 months; 11 months by default).
+- **-WhatIf**: preview the action without changing the tenant.
+
+For an authorized administrator, this attempts the app creation, tenant admin consent, and eDiscovery Manager membership in one run:
+
+~~~powershell
+$setup = .\scripts\New-EDiscoveryDownloaderApp.ps1 -TenantId '<tenant-guid>' -GrantAdminConsent -ConfigurePurviewRoles
+~~~
+
+Access to **all existing cases** can additionally require -GrantEDiscoveryAdministrator. This is much more privileged. Standard eDiscovery Manager role membership may not provide access to cases created by other users.
+
+### What is created?
+
+| Setting | Value |
+| --- | --- |
+| Name | HPUSA eDiscovery Downloader (override with -DisplayName) |
+| Supported accounts | Accounts in this organization only (AzureADMyOrg) |
+| Redirect URI | None; certificate-only app sign-in |
+| Credential | Non-exportable RSA-2048 certificate in Cert:\CurrentUser\My |
+| Microsoft Graph permission | eDiscovery.ReadWrite.All (Application) |
+| MicrosoftPurviewEDiscovery permission | eDiscovery.Download.Read (Application) |
+| Admin consent | Required; automatic consent is opt-in |
+| Purview role registration | Required; automatic registration is opt-in |
+
+**Who can run the setup?** An Entra account authorized to create app registrations and enterprise service principals (typically Cloud Application Administrator). Granting tenant-wide consent can require elevated administrative privileges. Changing Purview roles requires a Purview Role Management account.
+
+**Important:** Microsoft's app-only Graph eDiscovery APIs require cases with premium features enabled. Standard cases can use delegated APIs, but **this downloader currently uses app-only authentication**. An application might be correctly configured but still unable to access a standard case. The script cannot upgrade case features.
+
+If you omit the approval switches, finish manually:
+
+1. Open [Microsoft Entra admin center](https://entra.microsoft.com) → App registrations → HPUSA eDiscovery Downloader → API permissions → Grant admin consent.
+2. Connect to **Security & Compliance PowerShell** as a user with Purview Role Management (install ExchangeOnlineManagement and run Connect-IPPSSession). Use the enterprise application service principal object ID printed by the script, **not** the app registration object ID:
+
+~~~powershell
+New-ServicePrincipal -AppId '<ClientId>' -ObjectId '<ServicePrincipalObjectId>' -DisplayName 'HPUSA eDiscovery Downloader'
+Add-RoleGroupMember -Identity 'eDiscoveryManager' -Member '<ServicePrincipalObjectId>'
+
+# Optional, tenant-wide and only when authorized:
+Add-eDiscoveryCaseAdmin -User '<ServicePrincipalObjectId>'
+~~~
+
+3. Run Connect-EDiscovery and Test-EDiscoveryAccess. Verify that the specific case and export are accessible before initiating a large download.
+
+The setup script intentionally refuses to create a duplicate app with the same display name. Rotate certificates before expiration. Revoking permissions stops future API access but does not delete any files already downloaded.
+
 ## Quick start
 
 Use **PowerShell 7.2+ on Windows**. Open PowerShell in the cloned repository:
