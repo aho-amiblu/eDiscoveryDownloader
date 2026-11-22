@@ -41,6 +41,26 @@ Connect-EDiscovery -TenantId '<tenant-guid>' -ClientId '<app-guid>' `
 
 Certificate must be installed with a private key in **CurrentUser\Personal (My)**. Do not put client secrets or PSTs in GitHub. No credentials are committed by this project.
 
+## From Purview's "Download support information" JSON
+
+**Fastest route if you already know the export:** In Purview, open the completed export, select **Download support information**, and save the resulting JSON as support.json. Its jobId is the Graph export operation ID. You do **not** need to call Get-ExportList.
+
+~~~powershell
+Import-Module .\eDiscoveryDownloader.psm1
+
+# Authenticate with your configured Entra application, as explained above:
+Connect-EDiscovery -TenantId '<tenant-guid>' -ClientId '<app-guid>' -ClientSecret (Read-Host 'Client secret' -AsSecureString)
+
+Import-ExportSupportInfo -Path '.\support.json' |
+    Download-Export -DestinationFolder 'D:\eDiscovery'
+
+# Or paste the support JSON into your clipboard:
+Get-Clipboard -Raw | Import-ExportSupportInfo |
+    Download-Export -DestinationFolder 'D:\eDiscovery'
+~~~
+
+Import-ExportSupportInfo only parses and validates the support JSON, mapping caseId and jobId to a downloadable export object. It does not contain download URLs or access credentials. **The existing app authentication is still required for Download-Export.** The command checks that the support JSON's tenant matches the connected tenant. An interactive user can also use Microsoft Graph PowerShell to retrieve package metadata without a custom app registration (subject to delegated permissions), but downloading through the separate Purview API still requires appropriate authentication.
+
 ## One-time Entra / Purview configuration
 
 The module installs missing `Microsoft.Graph.Authentication` and `MSAL.PS` modules for CurrentUser (use `-NoInstall` to prevent this), but **cannot grant itself tenant permissions**.
@@ -66,6 +86,7 @@ Get-ExportList -CaseName 'My Case'
 | --- | --- | --- |
 | `Connect-EDiscovery` | `-TenantId`, `-ClientId`, **either** `-CertificateThumbprint` **or** `-ClientSecret`, `-NoInstall`, `-SkipPermissionCheck` | App-only connection, auto-install required modules |
 | `Test-EDiscoveryAccess` | none | Checks Graph case listing and token role |
+| Import-ExportSupportInfo | -Path or JSON from pipeline | Parses support JSON directly into a pipeline-ready export object |
 | `Get-ExportList` | `-CaseName`, `-CaseId`, `-Name`, `-Status` | Lists exports across accessible cases, follows Graph paging |
 | `Download-Export` | `-Export` (pipeline), **`-DestinationFolder`**, `-PackageName`, `-RetryCount`, `-Force`, `-NoSubfolder`, `-WhatIf` | Downloads all matching packages, returns one result object per package |
 
